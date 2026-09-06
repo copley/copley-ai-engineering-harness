@@ -71,6 +71,7 @@ public class SslHandlerBackpressureTest {
                 ByteBuf payload = server.alloc().heapBuffer(CHUNK_SIZE, CHUNK_SIZE).writeZero(CHUNK_SIZE);
                 lastFlushedFuture = server.pipeline().write(payload);
             }
+            final ChannelFuture flushedFuture = lastFlushedFuture;
 
             assertFalse(server.isWritable(), "queued plaintext should participate in channel writability");
             server.flush();
@@ -85,15 +86,15 @@ public class SslHandlerBackpressureTest {
                     server.alloc().heapBuffer(CHUNK_SIZE, CHUNK_SIZE).writeZero(CHUNK_SIZE));
 
             int iterations = 0;
-            while (!lastFlushedFuture.isDone() && iterations++ < 128) {
+            while (!flushedFuture.isDone() && iterations++ < 128) {
                 assertTrue(slowTransport.pendingBytes() <= allowedBurst,
                         "each resumed TLS burst must remain bounded by the transport watermark");
                 slowTransport.releaseAll();
                 server.runPendingTasks();
             }
 
-            assertTrue(lastFlushedFuture.isSuccess(),
-                    () -> "the originally flushed batch did not drain: " + lastFlushedFuture.cause());
+            assertTrue(flushedFuture.isSuccess(),
+                    () -> "the originally flushed batch did not drain: " + flushedFuture.cause());
             assertFalse(unflushedFuture.isDone(),
                     "data written after the flush boundary must remain unflushed during asynchronous resume");
             assertTrue(slowTransport.maxPendingBytes() <= allowedBurst,
