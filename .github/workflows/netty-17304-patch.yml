@@ -80,9 +80,11 @@ jobs:
           cd netty-upstream
           git checkout 1df2a41271401fd5107c0dfda96cac21c00f1278
 
-      - name: Apply candidate SslHandler repair
+      - name: Apply complete SslHandler repair
         run: |
           python3 projects/netty-17304/apply_netty_patch.py \
+            netty-upstream/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
+          python3 projects/netty-17304/apply_alert_compat_patch.py \
             netty-upstream/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
           mkdir -p netty-upstream/handler/src/test/java/io/netty/handler/ssl
           mkdir -p netty-upstream/handler/src/test/java/io/netty/channel
@@ -103,6 +105,15 @@ jobs:
         run: |
           ./mvnw -B -ntp -pl handler -am \
             -Dtest=SslHandlerBackpressureTest \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+            -Dcheckstyle.skip=true \
+            test
+
+      - name: Run JDK compatibility sentinels
+        working-directory: netty-upstream
+        run: |
+          ./mvnw -B -ntp -pl handler -am \
+            '-Dtest=SslHandlerTest#testHandshakeFailureCipherMissmatchTLSv12Jdk+testHandshakeFailureCipherMissmatchTLSv13Jdk+testIncorrectLength' \
             -Dsurefire.failIfNoSpecifiedTests=false \
             -Dcheckstyle.skip=true \
             test
