@@ -1,309 +1,115 @@
 # Engineering Harness State
 
-This file contains the persistent working state for the AI Engineering Harness.
+This file is the persistent handoff state for the AI Engineering Harness. Keep it concise, current, and evidence-based.
 
-It is intended to allow a new AI agent or model to understand the current engineering situation without relying on previous conversational context.
-
-Keep this file concise, current, and evidence-based.
-
----
-
-# Harness Status
+## Harness Status
 
 ```text
-Status: INITIALIZATION
-Lifecycle Stage: HARNESS DESIGN
-Current Project: NONE
+Status: ACTIVE
+Lifecycle Stage: REPRODUCTION / EVIDENCE
+Current Project: Netty #17304
+Upstream: netty/netty
+Issue: https://github.com/netty/netty/issues/17304
 ```
 
----
+## Current Objective
 
-# Current Objective
+Determine the actual ownership boundary behind the pooled direct-memory increase reported in Netty #17304, produce a real TLS reproducer, and only then design the smallest upstream-safe repair.
 
-Establish the minimum viable structure for a persistent, model-independent AI engineering harness capable of directing advanced AI agents through serious software-engineering investigations.
-
-The harness should support projects that may continue across multiple sessions, days, or weeks.
-
----
-
-# Current Repository Model
-
-The minimum initial control plane consists of:
+The target failure class is buffering/backpressure behavior across:
 
 ```text
-README.md
-AGENTS.md
-STATE.md
+application writes
+-> ChunkedWriteHandler
+-> HTTP encoder
+-> SslHandler pending plaintext
+-> TLS wrap
+-> ChannelOutboundBuffer
+-> slow peer
 ```
 
-Responsibilities:
+## Confirmed Facts
+
+1. Netty #13711 changed `ChunkedWriteHandler` so ordinary non-`ChunkedInput` messages bypass its internal queue when no chunked write is pending.
+2. This creates a real behavior boundary between 4.1.104 and 4.1.105+: ordinary writes now reach downstream encoders before the later `flush()`.
+3. The reporter's reproducer proves that propagation boundary and demonstrates direct-buffer staging before flush using a synthetic downstream direct-buffering handler.
+4. Reverting #13711 is not currently the preferred architectural direction in the upstream discussion; maintainers have questioned whether `ChunkedWriteHandler` should buffer unrelated messages at all.
+5. `SslHandler.write(...)` does not encrypt immediately. It adds outbound `ByteBuf`s to `pendingUnencryptedWrites`.
+6. In current 4.1 and in 4.1.105, that queue is backed by `AbstractCoalescingBufferQueue` with the channel supplied to its constructor.
+7. `AbstractCoalescingBufferQueue` creates a `PendingBytesTracker` and increments/decrements pending outbound bytes as buffers enter/leave the queue. The tracker updates the channel pipeline / outbound-buffer writability accounting.
+
+## Important Contradiction Found
+
+The latest issue hypothesis says that bytes retained in `SslHandler.pendingUnencryptedWrites` do not participate in channel write-buffer watermarks.
+
+Source inspection contradicts that hypothesis: the queue explicitly tracks its readable bytes as pending outbound bytes.
+
+Therefore no `SslHandler` writability-accounting patch should be written until an executable test proves a gap that source inspection has missed.
+
+## Active Hypotheses
+
+### H1 — source-level writability accounting is correct
+
+`SslHandler` pending plaintext bytes already make the channel unwritable at the configured high watermark. If confirmed, the current issue hypothesis about missing watermark accounting is rejected.
+
+Status: SUPPORTED BY SOURCE, NOT YET EXECUTION-VERIFIED.
+
+### H2 — direct-memory amplification is caused earlier in the outbound pipeline
+
+After #13711, ordinary messages reach encoders immediately. Any upstream encoder/application allocation of pooled direct `ByteBuf`s therefore happens before flush and those direct buffers are retained by `SslHandler` until flush. The memory representation changes even if logical pending-byte accounting remains correct.
+
+Status: SUPPORTED BY PIPELINE MECHANICS; REAL-TLS REPRODUCTION REQUIRED.
+
+### H3 — application/framework batching can still exceed useful memory bounds
+
+Even with correct channel writability accounting, a framework may enqueue a large batch before reacting to writability changes, or many simultaneously writable channels may each retain up to their per-channel high watermark. This can produce a large aggregate direct-memory plateau under many slow consumers.
+
+Status: OPEN.
+
+## Rejected / Suspended Approaches
+
+### Revert #13711 immediately
+
+Suspended. This restores historical buffering but makes `ChunkedWriteHandler` responsible for non-chunked messages again and conflicts with maintainer direction.
+
+### Add pending-byte accounting to `SslHandler`
+
+Rejected as a speculative fix unless reproduction disproves current source behavior. The accounting already exists in `AbstractCoalescingBufferQueue`.
+
+## Current Experiment
+
+Build a self-contained executable test against released Netty versions that uses the real outbound pipeline shape:
 
 ```text
-README.md
-    public mission
-    architecture
-    engineering philosophy
-    project lifecycle
-
-AGENTS.md
-    mandatory agent behavior
-    evidence requirements
-    implementation constraints
-    testing rules
-    state handoff rules
-
-STATE.md
-    current engineering state
-    active objective
-    confirmed decisions
-    unresolved questions
-    handoff information
+ChunkedWriteHandler
+-> HttpResponseEncoder
+-> SslHandler
+-> EmbeddedChannel transport
 ```
 
-Additional files should not be introduced until a real engineering project demonstrates the need for them.
+The experiment must:
 
----
+- write without flushing;
+- configure a deliberately low `WriteBufferWaterMark`;
+- observe exactly when `channel.isWritable()` changes;
+- distinguish heap/direct input buffers;
+- measure pooled direct-memory allocation;
+- compare 4.1.104.Final with 4.1.135.Final;
+- confirm whether `SslHandler` encrypts/copies before flush;
+- record how much data can be queued before backpressure is visible.
 
-# Confirmed Design Decisions
+## Definition of the Next Gate
 
-## 1. This is not a daily challenge repository
+Do not modify upstream production code until the real-pipeline experiment answers these questions:
 
-Projects may remain active for as long as required.
+1. Do `SslHandler` pending writes affect `Channel.isWritable()` before flush?
+2. Which component allocates the pooled direct buffers observed before flush?
+3. Is the memory growth bounded by configured channel watermarks when the producer respects writability?
+4. Does the answer differ between 4.1.104 and 4.1.135?
 
-Engineering quality takes precedence over artificial daily completion.
+## Next Recommended Action
 
----
+Run the Netty 4.1.104 / 4.1.135 experiment in CI, inspect the measurements, then either:
 
-## 2. The harness is model-independent
-
-The repository must preserve enough state that work can move between different AI models and tools.
-
-The model is replaceable.
-
-The repository owns persistent engineering memory.
-
----
-
-## 3. Evidence precedes implementation
-
-The normal defect workflow is:
-
-```text
-DISCOVERY
--> REPRODUCTION
--> EVIDENCE
--> ROOT CAUSE
--> DESIGN
--> IMPLEMENTATION
--> VERIFICATION
--> REVIEW
-```
-
-Agents should not jump directly from issue description to speculative patch.
-
----
-
-## 4. Human engineering authority remains explicit
-
-AI agents may perform substantial investigation and implementation.
-
-The human engineer retains authority over:
-
-* objectives
-* scope
-* risk
-* architecture
-* acceptance
-* external publication
-* production access
-
----
-
-## 5. The harness should demonstrate serious engineering
-
-Target problem classes include:
-
-* concurrency
-* memory/resource leaks
-* runtime failures
-* distributed systems
-* pathological performance
-* CI/CD
-* infrastructure
-* database consistency
-* networking
-* production reliability
-* difficult open-source defects
-
-The primary public signal should be engineering judgment and evidence, not generated code volume.
-
----
-
-# Current Architecture
-
-```text
-Human Engineer
-      |
-      v
-AI Engineering Harness
-      |
-      +--> Investigation
-      |
-      +--> Systems Analysis
-      |
-      +--> Implementation
-      |
-      +--> Testing
-      |
-      +--> Independent Review
-      |
-      v
-Human Acceptance
-```
-
-Agent roles are conceptual.
-
-They may be performed by separate models or separate sessions of the same model.
-
----
-
-# Current Engineering Principles
-
-1. Reproduce before repairing where reasonably possible.
-2. Preserve evidence.
-3. Maintain competing hypotheses.
-4. Establish failure mechanism before implementation.
-5. Prefer minimal repairs.
-6. Test the failure contract.
-7. Attempt to disprove the fix.
-8. Record important architectural decisions.
-9. Maintain least-privilege access.
-10. Preserve cross-model handoff state in Git.
-
----
-
-# Active Project
-
-None.
-
-The next substantial step should be to select the first real engineering problem for the harness.
-
-The first project should ideally be difficult enough to require:
-
-* repository understanding
-* diagnosis
-* experimentation
-* root-cause reasoning
-* implementation
-* regression testing
-* adversarial verification
-
-Avoid trivial CRUD applications or simple feature generation as the first flagship demonstration.
-
----
-
-# Candidate First-Project Characteristics
-
-Prefer a problem with several of the following:
-
-* real failure report
-* non-obvious root cause
-* existing substantial codebase
-* observable failure
-* concurrency or lifecycle complexity
-* measurable performance behavior
-* meaningful regression risk
-* possibility of an upstream contribution
-* strong verification path
-
-Possible domains:
-
-```text
-JVM / Java
-Netty
-Gradle
-Elasticsearch
-Kubernetes
-CI runners
-distributed systems
-database engines
-runtime infrastructure
-```
-
----
-
-# Open Questions
-
-* Which real engineering problem should become the first flagship harness project?
-* Should individual projects live directly in this repository or use external repositories with this harness acting as the control plane?
-* At what point should project-specific files such as `HYPOTHESES.md` and `EVIDENCE.md` be introduced?
-* How should multiple agents hand work to one another once orchestration becomes automated?
-* What verification threshold should be required before publishing a project as completed?
-* How should agent execution history be captured without turning Git into a conversational transcript archive?
-
----
-
-# Rejected Approaches
-
-## Daily completion requirement
-
-Rejected.
-
-Reason:
-
-Complex engineering problems should remain active until sufficiently understood and verified.
-
----
-
-## AI-generated application showcase
-
-Rejected as the primary purpose.
-
-Reason:
-
-The repository should demonstrate control of advanced AI engineering workflows rather than the ability to generate ordinary applications.
-
----
-
-## Model-specific persistent memory
-
-Rejected.
-
-Reason:
-
-Long-term engineering state must survive model replacement.
-
----
-
-# Next Recommended Action
-
-Select one difficult real-world engineering problem and initialize it as the first harness project.
-
-Before implementation begins, the agent should establish:
-
-```text
-problem statement
-repository / system under investigation
-expected behavior
-observed behavior
-environment
-initial evidence
-reproduction plan
-```
-
-The first project should be treated as a test of the harness itself.
-
-Any weaknesses discovered in the engineering process should result in improvements to the harness rules rather than ad-hoc conversational instructions.
-
----
-
-# Handoff
-
-A new agent entering this repository should:
-
-1. Read `README.md`.
-2. Read `AGENTS.md`.
-3. Read this file.
-4. Confirm that no active engineering project currently exists.
-5. Help select or initialize the first serious investigation.
-6. Do not begin speculative implementation before defining and reproducing the engineering problem.
+- reject the current `SslHandler` hypothesis and move the investigation to encoder/framework batching, or
+- isolate a concrete accounting gap and write a minimal Netty regression test plus patch.
