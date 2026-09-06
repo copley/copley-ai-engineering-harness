@@ -108,13 +108,22 @@ jobs:
             test
 
       - name: Run existing SslHandler regression suites
+        id: ssl-suites
         working-directory: netty-upstream
+        shell: bash
         run: |
+          set +e
           ./mvnw -B -ntp -pl handler -am \
             -Dtest=SslHandlerTest,SslHandlerCoalescingBufferQueueTest,SslHandlerBackpressureTest \
             -Dsurefire.failIfNoSpecifiedTests=false \
             -Dcheckstyle.skip=true \
-            test
+            test 2>&1 | tee ../ssl-suite.log
+          status=${PIPESTATUS[0]}
+          set -e
+          mkdir -p ../ssl-suite-reports
+          find handler/target/surefire-reports -maxdepth 1 -type f -print -exec cp '{}' ../ssl-suite-reports/ \; 2>/dev/null || true
+          echo "$status" > ../ssl-suite-status.txt
+          exit "$status"
 
       - name: Show candidate patch
         if: always()
@@ -125,3 +134,12 @@ jobs:
         with:
           name: netty-17304-candidate-patch
           path: netty-17304-candidate.patch
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: netty-17304-ssl-suite-diagnostics
+          path: |
+            ssl-suite.log
+            ssl-suite-status.txt
+            ssl-suite-reports/
