@@ -56,6 +56,10 @@ jobs:
         run: |
           python3 projects/netty-17304/apply_netty_patch.py \
             netty-patched/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
+          python3 projects/netty-17304/apply_alert_compat_patch.py \
+            netty-patched/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
+          cd netty-patched
+          git diff --check
       - name: Run JDK SslHandler compatibility sentinels on patch
         working-directory: netty-patched
         run: |
