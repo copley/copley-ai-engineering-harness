@@ -6,7 +6,7 @@ This file is the persistent handoff state for the AI Engineering Harness. Keep i
 
 ```text
 Status: ACTIVE
-Lifecycle Stage: REPRODUCTION / EVIDENCE
+Lifecycle Stage: ROOT CAUSE / DESIGN
 Current Project: Netty #17304
 Upstream: netty/netty
 Issue: https://github.com/netty/netty/issues/17304
@@ -14,102 +14,114 @@ Issue: https://github.com/netty/netty/issues/17304
 
 ## Current Objective
 
-Determine the actual ownership boundary behind the pooled direct-memory increase reported in Netty #17304, produce a real TLS reproducer, and only then design the smallest upstream-safe repair.
+Design and verify the smallest upstream-safe repair for the TLS direct-memory amplification exposed by Netty #17304.
 
-The target failure class is buffering/backpressure behavior across:
+The proven failure path is:
 
 ```text
-application writes
--> ChunkedWriteHandler
--> HTTP encoder
+large pre-flush application batch
+-> ChunkedWriteHandler pass-through (4.1.105+)
+-> HttpResponseEncoder
 -> SslHandler pending plaintext
--> TLS wrap
--> ChannelOutboundBuffer
--> slow peer
+-> one flush
+-> SslHandler drains the whole pending plaintext queue
+-> TLS ciphertext buffers
+-> slow transport retains ciphertext
 ```
 
 ## Confirmed Facts
 
 1. Netty #13711 changed `ChunkedWriteHandler` so ordinary non-`ChunkedInput` messages bypass its internal queue when no chunked write is pending.
-2. This creates a real behavior boundary between 4.1.104 and 4.1.105+: ordinary writes now reach downstream encoders before the later `flush()`.
-3. The reporter's reproducer proves that propagation boundary and demonstrates direct-buffer staging before flush using a synthetic downstream direct-buffering handler.
-4. Reverting #13711 is not currently the preferred architectural direction in the upstream discussion; maintainers have questioned whether `ChunkedWriteHandler` should buffer unrelated messages at all.
-5. `SslHandler.write(...)` does not encrypt immediately. It adds outbound `ByteBuf`s to `pendingUnencryptedWrites`.
-6. In current 4.1 and in 4.1.105, that queue is backed by `AbstractCoalescingBufferQueue` with the channel supplied to its constructor.
-7. `AbstractCoalescingBufferQueue` creates a `PendingBytesTracker` and increments/decrements pending outbound bytes as buffers enter/leave the queue. The tracker updates the channel pipeline / outbound-buffer writability accounting.
+2. This creates a behavior boundary between 4.1.104 and 4.1.105+: ordinary writes now reach downstream encoders and `SslHandler` before the later `flush()`.
+3. `SslHandler.write(...)` itself does not encrypt immediately. It queues plaintext in `pendingUnencryptedWrites`.
+4. That queue already participates in Netty pending-byte / channel-writability accounting through `AbstractCoalescingBufferQueue` and `PendingBytesTracker`.
+5. Therefore the earlier hypothesis that `SslHandler` plaintext is invisible to write-buffer watermarks is false.
+6. `SslHandler.flush()` calls `wrapAndFlush()`, and `wrap()` loops over the pending plaintext queue without a downstream-writability/backpressure bound.
+7. For native OpenSSL/TCNative engines, `SslHandler` allocates TLS output with `allocator.directBuffer(...)`, so excessive flush-time conversion becomes pooled direct-memory pressure.
+8. Vert.x 4.4.1 user `Buffer` instances are heap-backed by default, and HTTP/1 response writes pass their underlying `ByteBuf` into Netty. The bulk direct-memory conversion therefore need not originate in the user buffer itself.
 
-## Important Contradiction Found
+## Reproduction Evidence
 
-The latest issue hypothesis says that bytes retained in `SslHandler.pendingUnencryptedWrites` do not participate in channel write-buffer watermarks.
+The harness has a real JDK-TLS client/server handshake plus a simulated slow transport that retains ciphertext and contributes those retained bytes to Netty's pending-byte accounting.
 
-Source inspection contradicts that hypothesis: the queue explicitly tracks its readable bytes as pending outbound bytes.
-
-Therefore no `SslHandler` writability-accounting patch should be written until an executable test proves a gap that source inspection has missed.
-
-## Active Hypotheses
-
-### H1 — source-level writability accounting is correct
-
-`SslHandler` pending plaintext bytes already make the channel unwritable at the configured high watermark. If confirmed, the current issue hypothesis about missing watermark accounting is rejected.
-
-Status: SUPPORTED BY SOURCE, NOT YET EXECUTION-VERIFIED.
-
-### H2 — direct-memory amplification is caused earlier in the outbound pipeline
-
-After #13711, ordinary messages reach encoders immediately. Any upstream encoder/application allocation of pooled direct `ByteBuf`s therefore happens before flush and those direct buffers are retained by `SslHandler` until flush. The memory representation changes even if logical pending-byte accounting remains correct.
-
-Status: SUPPORTED BY PIPELINE MECHANICS; REAL-TLS REPRODUCTION REQUIRED.
-
-### H3 — application/framework batching can still exceed useful memory bounds
-
-Even with correct channel writability accounting, a framework may enqueue a large batch before reacting to writability changes, or many simultaneously writable channels may each retain up to their per-channel high watermark. This can produce a large aggregate direct-memory plateau under many slow consumers.
-
-Status: OPEN.
-
-## Rejected / Suspended Approaches
-
-### Revert #13711 immediately
-
-Suspended. This restores historical buffering but makes `ChunkedWriteHandler` responsible for non-chunked messages again and conflicts with maintainer direction.
-
-### Add pending-byte accounting to `SslHandler`
-
-Rejected as a speculative fix unless reproduction disproves current source behavior. The accounting already exists in `AbstractCoalescingBufferQueue`.
-
-## Current Experiment
-
-Build a self-contained executable test against released Netty versions that uses the real outbound pipeline shape:
+Configuration:
 
 ```text
-ChunkedWriteHandler
--> HttpResponseEncoder
--> SslHandler
--> EmbeddedChannel transport
+payload batch: 64 KiB
+write-buffer low watermark: 2 KiB
+write-buffer high watermark: 4 KiB
+pipeline: ChunkedWriteHandler -> HttpResponseEncoder -> SslHandler -> slow transport
 ```
 
-The experiment must:
+Observed in GitHub Actions:
 
-- write without flushing;
-- configure a deliberately low `WriteBufferWaterMark`;
-- observe exactly when `channel.isWritable()` changes;
-- distinguish heap/direct input buffers;
-- measure pooled direct-memory allocation;
-- compare 4.1.104.Final with 4.1.135.Final;
-- confirm whether `SslHandler` encrypts/copies before flush;
-- record how much data can be queued before backpressure is visible.
+### Netty 4.1.104.Final
 
-## Definition of the Next Gate
+```text
+before flush: writable=true
+plaintext already at TLS boundary: 0 bytes
+ciphertext retained after flush: 4,209 bytes
+```
 
-Do not modify upstream production code until the real-pipeline experiment answers these questions:
+### Netty 4.1.135.Final
 
-1. Do `SslHandler` pending writes affect `Channel.isWritable()` before flush?
-2. Which component allocates the pooled direct buffers observed before flush?
-3. Is the memory growth bounded by configured channel watermarks when the producer respects writability?
-4. Does the answer differ between 4.1.104 and 4.1.135?
+```text
+before flush: writable=false
+plaintext already at TLS boundary: 66,031 bytes
+ciphertext retained after flush: 66,221 bytes
+```
 
-## Next Recommended Action
+Both tests pass deterministically.
 
-Run the Netty 4.1.104 / 4.1.135 experiment in CI, inspect the measurements, then either:
+This is the regression mechanism: the old `ChunkedWriteHandler` forwarding loop admitted roughly a watermark-sized amount into TLS before stopping on `Channel.isWritable()`. After #13711, the full batch can already be staged in `SslHandler`; its subsequent flush converts the whole staged batch even though the channel is already unwritable.
 
-- reject the current `SslHandler` hypothesis and move the investigation to encoder/framework batching, or
-- isolate a concrete accounting gap and write a minimal Netty regression test plus patch.
+## Root Cause
+
+The root cause is not missing `SslHandler` pending-byte accounting.
+
+It is a mismatch between two forms of backpressure:
+
+- `SslHandler` correctly marks the channel unwritable as plaintext accumulates.
+- once `flush()` is invoked, `SslHandler.wrap()` does not use downstream capacity to bound how much already-staged plaintext it converts into ciphertext.
+
+Before #13711, `ChunkedWriteHandler` accidentally supplied that bound by forwarding queued ordinary messages only while the channel remained writable. #13711 removed that accidental pre-TLS gate.
+
+## Rejected Approaches
+
+### Add writability accounting to `SslHandler`
+
+Rejected. The accounting already exists and is execution-verified.
+
+### Blindly revert #13711
+
+Rejected as the default repair. It restores the old accidental interaction but conflicts with maintainer direction that `ChunkedWriteHandler` should not generally buffer unrelated messages.
+
+### Simply stop `SslHandler.wrap()` whenever `Channel.isWritable()` is false
+
+Rejected. The queued plaintext itself contributes to channel unwritability; stopping solely on `isWritable()` can deadlock a flushed backlog because the plaintext cannot leave the queue to make the channel writable again.
+
+## Design Requirement
+
+A correct `SslHandler` repair must:
+
+1. preserve write-vs-flush semantics;
+2. preserve TLS handshake/control-message progress;
+3. bound plaintext-to-ciphertext conversion by downstream capacity;
+4. continue making progress after slow-transport writes drain;
+5. avoid wrapping writes that arrived after the relevant flush boundary;
+6. preserve promise ordering and failure propagation;
+7. avoid throughput regressions for normally writable channels.
+
+A likely design needs an explicit flushed-plaintext boundary plus resumable wrapping, rather than a bare `channel.isWritable()` check.
+
+## Current Next Action
+
+Prototype the smallest `SslHandler` design that records how many pending plaintext bytes were covered by a user flush, wraps only a bounded portion when downstream transport is backpressured, and resumes that flushed backlog when emitted ciphertext completes.
+
+Then run:
+
+- the new #17304 regression test;
+- existing `SslHandler` tests;
+- existing `ChunkedWriteHandler` tests;
+- JDK SSL and native OpenSSL variants where available;
+- stress checks for promise ordering, later unflushed writes, handshake, close-notify, and partial engine consumption.
