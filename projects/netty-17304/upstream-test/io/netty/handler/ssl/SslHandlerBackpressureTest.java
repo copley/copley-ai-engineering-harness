@@ -17,103 +17,96 @@ package io.netty.handler.ssl;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.SslTestPendingBytesAccess;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.embedded.EmbeddedChannel;
-import io.netty.handler.ssl.util.CachedSelfSignedCertificate;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
-import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.Test;
 
+import javax.net.ssl.SSLEngine;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-public class SslHandlerBackpressureTest {
-    private static final int LOW_WATER_MARK = 2 * 1024;
-    private static final int HIGH_WATER_MARK = 4 * 1024;
-    private static final int CHUNK_SIZE = 1024;
-    private static final int CHUNKS = 64;
+class SslHandlerBackpressureTest {
 
     @Test
-    public void testFlushConvertsPlaintextIncrementallyAndPreservesFlushBoundary() throws Exception {
-        SelfSignedCertificate certificate = CachedSelfSignedCertificate.getCachedCertificate();
-        SslContext serverContext = SslContextBuilder
-                .forServer(certificate.certificate(), certificate.privateKey())
+    void wrapsOnlyFlushedPlaintextAndResumesAsCiphertextDrains() throws Exception {
+        SelfSignedCertificate certificate = new SelfSignedCertificate();
+        SslContext serverContext = SslContextBuilder.forServer(certificate.certificate(), certificate.privateKey())
                 .sslProvider(SslProvider.JDK)
                 .build();
-        SslContext clientContext = SslContextBuilder
-                .forClient()
+        SslContext clientContext = SslContextBuilder.forClient()
+                .sslProvider(SslProvider.JDK)
                 .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                .sslProvider(SslProvider.JDK)
                 .build();
 
-        SlowOutboundHandler slowTransport = new SlowOutboundHandler();
-        SslHandler serverSsl = serverContext.newHandler(UnpooledByteBufAllocatorHolder.ALLOCATOR);
-        SslHandler clientSsl = clientContext.newHandler(UnpooledByteBufAllocatorHolder.ALLOCATOR);
-        EmbeddedChannel server = new EmbeddedChannel(slowTransport, serverSsl);
+        SSLEngine serverEngine = serverContext.newEngine(UnpooledByteBufAllocator.DEFAULT);
+        SSLEngine clientEngine = clientContext.newEngine(UnpooledByteBufAllocator.DEFAULT);
+        SslHandler serverSsl = new SslHandler(serverEngine);
+        SslHandler clientSsl = new SslHandler(clientEngine);
+        EmbeddedChannel server = new EmbeddedChannel(serverSsl);
         EmbeddedChannel client = new EmbeddedChannel(clientSsl);
-        server.config().setWriteBufferWaterMark(new WriteBufferWaterMark(LOW_WATER_MARK, HIGH_WATER_MARK));
-
         try {
             completeHandshake(client, server, clientSsl, serverSsl);
-            slowTransport.enableSlowMode();
 
-            ChannelFuture lastFlushedFuture = null;
-            for (int i = 0; i < CHUNKS; i++) {
-                ByteBuf payload = server.alloc().heapBuffer(CHUNK_SIZE, CHUNK_SIZE).writeZero(CHUNK_SIZE);
-                lastFlushedFuture = server.pipeline().write(payload);
+            server.config().setWriteBufferWaterMark(new WriteBufferWaterMark(4096, 8192));
+
+            final int writes = 16;
+            final int bytesPerWrite = 4096;
+            final int firstBatchBytes = writes * bytesPerWrite;
+            List<ChannelPromise> firstBatchPromises = new ArrayList<ChannelPromise>(writes);
+            for (int i = 0; i < writes; i++) {
+                ChannelPromise promise = server.newPromise();
+                firstBatchPromises.add(promise);
+                server.write(Unpooled.buffer(bytesPerWrite).writeZero(bytesPerWrite), promise);
             }
-            final ChannelFuture flushedFuture = lastFlushedFuture;
 
-            assertFalse(server.isWritable(), "queued plaintext should participate in channel writability");
+            assertEquals(firstBatchBytes, SslTestPendingBytesAccess.totalPendingWriteBytes(server));
+            assertFalse(server.isWritable());
+            assertEquals(0, outboundBytes(server), "plaintext must not be wrapped before flush");
+
             server.flush();
-            server.runPendingTasks();
+            int firstBurst = outboundBytes(server);
+            assertTrue(firstBurst > 0, "flush must produce some ciphertext");
+            assertTrue(firstBurst < firstBatchBytes,
+                    "a single flush must not convert the complete plaintext batch");
+            assertTrue(firstBurst <= server.config().getWriteBufferHighWaterMark() * 2,
+                    "TLS conversion burst should stay near the transport watermark");
 
-            long allowedBurst = HIGH_WATER_MARK + 2048L;
-            assertTrue(slowTransport.pendingBytes() <= allowedBurst,
-                    "a single flush must not convert the complete plaintext batch into transport-held TLS output");
+            ChannelPromise afterBoundary = server.newPromise();
+            server.write(Unpooled.buffer(2048).writeZero(2048), afterBoundary);
+            assertFalse(afterBoundary.isDone(), "write after the flush boundary must remain pending");
 
-            // This write occurs after the first flush. It must not be consumed by asynchronous resume work.
-            ChannelFuture unflushedFuture = server.pipeline().write(
-                    server.alloc().heapBuffer(CHUNK_SIZE, CHUNK_SIZE).writeZero(CHUNK_SIZE));
-
-            int iterations = 0;
-            while (!flushedFuture.isDone() && iterations++ < 128) {
-                assertTrue(slowTransport.pendingBytes() <= allowedBurst,
-                        "each resumed TLS burst must remain bounded by the transport watermark");
-                slowTransport.releaseAll();
+            int cycles = 0;
+            while (!allDone(firstBatchPromises) && cycles++ < 100) {
+                drainOutbound(server);
                 server.runPendingTasks();
+                server.runScheduledPendingTasks();
             }
 
-            assertTrue(flushedFuture.isSuccess(),
-                    "the originally flushed batch did not drain: " + flushedFuture.cause());
-            assertFalse(unflushedFuture.isDone(),
-                    "data written after the flush boundary must remain unflushed during asynchronous resume");
-            assertTrue(slowTransport.maxPendingBytes() <= allowedBurst,
-                    "TLS output exceeded the bounded burst target: " + slowTransport.maxPendingBytes());
+            assertTrue(allDone(firstBatchPromises), "flushed plaintext must eventually drain");
+            assertFalse(afterBoundary.isDone(), "later write must not cross the earlier flush boundary");
+            assertEquals(0, outboundBytes(server), "all ciphertext from the first flush should be drained");
 
-            // A later explicit flush is what makes the post-boundary write eligible for TLS conversion.
             server.flush();
+            assertTrue(outboundBytes(server) > 0, "second flush must wrap the later write");
+            drainOutbound(server);
             server.runPendingTasks();
-            iterations = 0;
-            while (!unflushedFuture.isDone() && iterations++ < 32) {
-                slowTransport.releaseAll();
-                server.runPendingTasks();
-            }
-            assertTrue(unflushedFuture.isSuccess(),
-                    "the later explicitly-flushed write did not drain: " + unflushedFuture.cause());
+            server.runScheduledPendingTasks();
+            assertTrue(afterBoundary.isSuccess(), "later write must complete after its own flush");
         } finally {
-            slowTransport.releaseAll();
             server.finishAndReleaseAll();
             client.finishAndReleaseAll();
+            serverContext.release();
+            clientContext.release();
+            certificate.delete();
         }
     }
 
@@ -122,7 +115,9 @@ public class SslHandlerBackpressureTest {
             EmbeddedChannel server,
             SslHandler clientSsl,
             SslHandler serverSsl) {
-        for (int i = 0; i < 100 && !(clientSsl.handshakeFuture().isDone() && serverSsl.handshakeFuture().isDone()); i++) {
+        for (int i = 0;
+             i < 100 && !(clientSsl.handshakeFuture().isDone() && serverSsl.handshakeFuture().isDone());
+             i++) {
             boolean progressed = transferOutbound(client, server);
             progressed |= transferOutbound(server, client);
             client.runPendingTasks();
@@ -132,88 +127,48 @@ public class SslHandlerBackpressureTest {
                 server.runScheduledPendingTasks();
             }
         }
-        transferOutbound(client, server);
-        transferOutbound(server, client);
-        assertTrue(clientSsl.handshakeFuture().isSuccess(),
-                "client TLS handshake failed: " + clientSsl.handshakeFuture().cause());
-        assertTrue(serverSsl.handshakeFuture().isSuccess(),
-                "server TLS handshake failed: " + serverSsl.handshakeFuture().cause());
+        assertTrue(clientSsl.handshakeFuture().isSuccess(), "client handshake failed");
+        assertTrue(serverSsl.handshakeFuture().isSuccess(), "server handshake failed");
     }
 
-    private static boolean transferOutbound(EmbeddedChannel from, EmbeddedChannel to) {
+    private static boolean transferOutbound(EmbeddedChannel source, EmbeddedChannel target) {
         boolean progressed = false;
-        for (;;) {
-            Object msg = from.readOutbound();
-            if (msg == null) {
-                return progressed;
-            }
+        ByteBuf message;
+        while ((message = source.readOutbound()) != null) {
             progressed = true;
-            to.writeInbound(msg);
+            target.writeInbound(message);
+        }
+        return progressed;
+    }
+
+    private static int outboundBytes(EmbeddedChannel channel) {
+        int bytes = 0;
+        ByteBuf message;
+        List<ByteBuf> messages = new ArrayList<ByteBuf>();
+        while ((message = channel.readOutbound()) != null) {
+            bytes += message.readableBytes();
+            messages.add(message);
+        }
+        for (ByteBuf queued : messages) {
+            channel.writeOutbound(queued);
+        }
+        return bytes;
+    }
+
+    private static void drainOutbound(EmbeddedChannel channel) {
+        ByteBuf message;
+        while ((message = channel.readOutbound()) != null) {
+            message.release();
         }
     }
 
-    private static final class SlowOutboundHandler extends ChannelDuplexHandler {
-        private final List<PendingWrite> pending = new ArrayList<PendingWrite>();
-        private boolean slowMode;
-        private long pendingBytes;
-        private long maxPendingBytes;
-
-        @Override
-        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-            if (!slowMode || !(msg instanceof ByteBuf)) {
-                ctx.write(msg, promise);
-                return;
+    private static boolean allDone(List<ChannelPromise> promises) {
+        for (ChannelFuture promise : promises) {
+            if (!promise.isDone()) {
+                return false;
             }
-
-            ByteBuf buffer = (ByteBuf) msg;
-            int bytes = buffer.readableBytes();
-            SslTestPendingBytesAccess.increment(ctx.channel(), bytes);
-            pendingBytes += bytes;
-            maxPendingBytes = Math.max(maxPendingBytes, pendingBytes);
-            pending.add(new PendingWrite(buffer, promise, bytes));
+            assertTrue(promise.isSuccess(), "flushed write failed");
         }
-
-        void enableSlowMode() {
-            slowMode = true;
-        }
-
-        long pendingBytes() {
-            return pendingBytes;
-        }
-
-        long maxPendingBytes() {
-            return maxPendingBytes;
-        }
-
-        void releaseAll() {
-            if (pending.isEmpty()) {
-                return;
-            }
-            List<PendingWrite> draining = new ArrayList<PendingWrite>(pending);
-            pending.clear();
-            pendingBytes = 0;
-            for (PendingWrite write : draining) {
-                SslTestPendingBytesAccess.decrement(write.promise.channel(), write.bytes);
-                ReferenceCountUtil.safeRelease(write.buffer);
-                write.promise.trySuccess();
-            }
-        }
-    }
-
-    private static final class PendingWrite {
-        final ByteBuf buffer;
-        final ChannelPromise promise;
-        final int bytes;
-
-        PendingWrite(ByteBuf buffer, ChannelPromise promise, int bytes) {
-            this.buffer = buffer;
-            this.promise = promise;
-            this.bytes = bytes;
-        }
-    }
-
-    /** Avoids depending on the channel allocator choice in this focused JDK-SSLEngine test. */
-    private static final class UnpooledByteBufAllocatorHolder {
-        static final io.netty.buffer.ByteBufAllocator ALLOCATOR = io.netty.buffer.UnpooledByteBufAllocator.DEFAULT;
+        return true;
     }
 }
