@@ -1,0 +1,66 @@
+name: Netty 17304 JDK compatibility
+
+on:
+  push:
+    branches:
+      - netty-17304-fix
+    paths:
+      - 'projects/netty-17304/**'
+      - '.github/workflows/netty-17304-jdk-compat.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline-jdk-compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Clone pinned unmodified Netty 4.1
+        run: |
+          git clone --filter=blob:none https://github.com/netty/netty.git netty-baseline
+          cd netty-baseline
+          git checkout 1df2a41271401fd5107c0dfda96cac21c00f1278
+      - name: Run JDK SslHandler compatibility sentinels on baseline
+        working-directory: netty-baseline
+        run: |
+          ./mvnw -B -ntp -pl handler -am \
+            '-Dtest=SslHandlerTest#testHandshakeFailureCipherMissmatchTLSv12Jdk+testHandshakeFailureCipherMissmatchTLSv13Jdk+testIncorrectLength' \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+            -Dcheckstyle.skip=true \
+            test
+
+  patched-jdk-compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Clone pinned Netty 4.1
+        run: |
+          git clone --filter=blob:none https://github.com/netty/netty.git netty-patched
+          cd netty-patched
+          git checkout 1df2a41271401fd5107c0dfda96cac21c00f1278
+      - name: Apply candidate SslHandler repair
+        run: |
+          python3 projects/netty-17304/apply_netty_patch.py \
+            netty-patched/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
+      - name: Run JDK SslHandler compatibility sentinels on patch
+        working-directory: netty-patched
+        run: |
+          ./mvnw -B -ntp -pl handler -am \
+            '-Dtest=SslHandlerTest#testHandshakeFailureCipherMissmatchTLSv12Jdk+testHandshakeFailureCipherMissmatchTLSv13Jdk+testIncorrectLength' \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+            -Dcheckstyle.skip=true \
+            test
