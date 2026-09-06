@@ -1,0 +1,51 @@
+name: Netty 17304 native SSL validation
+
+on:
+  push:
+    branches:
+      - netty-17304-fix
+    paths:
+      - 'projects/netty-17304/**'
+      - '.github/workflows/netty-17304-native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  openssl-compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Clone pinned Netty 4.1
+        run: |
+          git clone --filter=blob:none https://github.com/netty/netty.git netty-native
+          cd netty-native
+          git checkout 1df2a41271401fd5107c0dfda96cac21c00f1278
+
+      - name: Apply complete SslHandler repair
+        run: |
+          python3 projects/netty-17304/apply_netty_patch.py \
+            netty-native/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
+          python3 projects/netty-17304/apply_alert_compat_patch.py \
+            netty-native/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
+          cd netty-native
+          git diff --check
+
+      - name: Run OpenSSL compatibility sentinels with static BoringSSL
+        working-directory: netty-native
+        run: |
+          ./mvnw -B -ntp -pl handler -am \
+            '-Dtest=SslHandlerTest#testHandshakeFailureCipherMissmatchTLSv12OpenSsl+testSslCompletionEventsTls12Openssl+testHandshakeWithImmediateExecutorOpenSsl+testHandshakeMTLSWithImmediateExecutorOpenSsl' \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+            -Dcheckstyle.skip=true \
+            -Dtcnative.artifactId=netty-tcnative-boringssl-static \
+            -Dtcnative.classifier= \
+            test

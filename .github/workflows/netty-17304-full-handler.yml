@@ -1,0 +1,63 @@
+name: Netty 17304 full handler validation
+
+on:
+  push:
+    branches:
+      - netty-17304-fix
+    paths:
+      - 'projects/netty-17304/**'
+      - '.github/workflows/netty-17304-full-handler.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-handler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Clone pinned Netty 4.1
+        run: |
+          git clone --filter=blob:none https://github.com/netty/netty.git netty-full
+          cd netty-full
+          git checkout 1df2a41271401fd5107c0dfda96cac21c00f1278
+
+      - name: Apply complete SslHandler repair and regression test
+        run: |
+          python3 projects/netty-17304/apply_netty_patch.py \
+            netty-full/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
+          python3 projects/netty-17304/apply_alert_compat_patch.py \
+            netty-full/handler/src/main/java/io/netty/handler/ssl/SslHandler.java
+          mkdir -p netty-full/handler/src/test/java/io/netty/handler/ssl
+          mkdir -p netty-full/handler/src/test/java/io/netty/channel
+          cp projects/netty-17304/upstream-test/io/netty/handler/ssl/SslHandlerBackpressureTest.java \
+            netty-full/handler/src/test/java/io/netty/handler/ssl/
+          cp projects/netty-17304/upstream-test/io/netty/channel/SslTestPendingBytesAccess.java \
+            netty-full/handler/src/test/java/io/netty/channel/
+          cd netty-full
+          git diff --check
+
+      - name: Build dependencies without tests
+        working-directory: netty-full
+        run: |
+          ./mvnw -B -ntp -pl handler -am \
+            -DskipTests \
+            -Dtcnative.artifactId=netty-tcnative-boringssl-static \
+            -Dtcnative.classifier= \
+            install
+
+      - name: Run complete handler module test suite
+        working-directory: netty-full
+        run: |
+          ./mvnw -B -ntp -pl handler \
+            -Dtcnative.artifactId=netty-tcnative-boringssl-static \
+            -Dtcnative.classifier= \
+            test
