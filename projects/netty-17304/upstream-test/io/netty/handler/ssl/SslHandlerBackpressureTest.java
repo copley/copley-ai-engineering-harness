@@ -94,7 +94,7 @@ public class SslHandlerBackpressureTest {
             }
 
             assertTrue(flushedFuture.isSuccess(),
-                    () -> "the originally flushed batch did not drain: " + flushedFuture.cause());
+                    "the originally flushed batch did not drain: " + flushedFuture.cause());
             assertFalse(unflushedFuture.isDone(),
                     "data written after the flush boundary must remain unflushed during asynchronous resume");
             assertTrue(slowTransport.maxPendingBytes() <= allowedBurst,
@@ -109,7 +109,7 @@ public class SslHandlerBackpressureTest {
                 server.runPendingTasks();
             }
             assertTrue(unflushedFuture.isSuccess(),
-                    () -> "the later explicitly-flushed write did not drain: " + unflushedFuture.cause());
+                    "the later explicitly-flushed write did not drain: " + unflushedFuture.cause());
         } finally {
             slowTransport.releaseAll();
             server.finishAndReleaseAll();
@@ -135,9 +135,9 @@ public class SslHandlerBackpressureTest {
         transferOutbound(client, server);
         transferOutbound(server, client);
         assertTrue(clientSsl.handshakeFuture().isSuccess(),
-                () -> "client TLS handshake failed: " + clientSsl.handshakeFuture().cause());
+                "client TLS handshake failed: " + clientSsl.handshakeFuture().cause());
         assertTrue(serverSsl.handshakeFuture().isSuccess(),
-                () -> "server TLS handshake failed: " + serverSsl.handshakeFuture().cause());
+                "server TLS handshake failed: " + serverSsl.handshakeFuture().cause());
     }
 
     private static boolean transferOutbound(EmbeddedChannel from, EmbeddedChannel to) {
