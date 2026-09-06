@@ -1,0 +1,29 @@
+name: Netty 17304 investigation
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'projects/netty-17304/**'
+      - '.github/workflows/netty-17304.yml'
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        netty-version:
+          - 4.1.104.Final
+          - 4.1.135.Final
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: projects/netty-17304/pom.xml
+      - name: Run real-pipeline experiment
+        working-directory: projects/netty-17304
+        run: mvn --batch-mode --no-transfer-progress -Dnetty.version=${{ matrix.netty-version }} test
